@@ -23,6 +23,9 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# cache
+schnellru = "0.2"
+
 # misc
 eyre.workspace = true
 hex.workspace = true
@@ -31,13 +34,12 @@ thiserror.workspace = true
 url.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-jsonrpsee = { version = "0.19.0", features = ["full"] }
+jsonrpsee = { version = "0.19.0", features = ["server", "macros", "client-core"] }
 openssl.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4.33"
-gloo-timers = "0.3.0"
-wasmtimer = "0.2.0"
+wasmtimer.workspace = true
 getrandom = { version = "0.3.1", features = ["wasm_js"] }
 
 [target.wasm32-unknown-unknown.dependencies]

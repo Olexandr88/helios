@@ -1,4 +1,6 @@
+use alloy::consensus::Transaction as _;
 use alloy::consensus::{BlockHeader, TrieAccount};
+use alloy::network::primitives::HeaderResponse;
 use alloy::network::{BlockResponse, ReceiptResponse, TransactionResponse};
 use alloy::primitives::{keccak256, Bytes, B256, U256};
 use alloy::rlp;
@@ -10,6 +12,7 @@ use alloy_trie::{
     HashBuilder, Nibbles, KECCAK_EMPTY,
 };
 use eyre::{eyre, Result};
+use helios_common::fork_schedule::ForkSchedule;
 
 use helios_common::network_spec::NetworkSpec;
 
@@ -143,7 +146,11 @@ pub fn verify_receipt_proof<N: NetworkSpec>(
     proof: &[Bytes],
 ) -> Result<()> {
     let key = {
-        let index = receipt.transaction_index().unwrap() as usize;
+        let index = receipt
+            .transaction_index()
+            .ok_or(ExecutionError::TransactionNotIncluded(
+                receipt.transaction_hash(),
+            ))? as usize;
         let index_buffer = rlp::encode_fixed_size(&index);
         Nibbles::unpack(&index_buffer)
     };
@@ -190,7 +197,9 @@ pub fn verify_transaction_proof<N: NetworkSpec>(
     proof: &[Bytes],
 ) -> Result<()> {
     let key = {
-        let index = tx.transaction_index().unwrap() as usize;
+        let index =
+            tx.transaction_index()
+                .ok_or(ExecutionError::TransactionNotIncluded(tx.tx_hash()))? as usize;
         let index_buffer = rlp::encode_fixed_size(&index);
         Nibbles::unpack(&index_buffer)
     };
@@ -226,6 +235,62 @@ pub fn ordered_trie_root_noop_encoder(items: &[Vec<u8>]) -> B256 {
     }
 
     ordered_trie_root_with_encoder(items, noop_encoder)
+}
+
+pub fn verify_authenticated_block_receipts<N: NetworkSpec>(
+    receipts: &[N::ReceiptResponse],
+    block: &N::BlockResponse,
+    forks: &ForkSchedule,
+) -> Result<()> {
+    let receipts_encoded = receipts.iter().map(N::encode_receipt).collect::<Vec<_>>();
+    let expected_receipt_root = ordered_trie_root_noop_encoder(&receipts_encoded);
+
+    if expected_receipt_root != block.header().receipts_root() {
+        return Err(
+            ExecutionError::BlockReceiptsRootMismatch(block.header().number().into()).into(),
+        );
+    }
+
+    let txs = block
+        .transactions()
+        .as_transactions()
+        .ok_or(eyre!("missing full transactions"))?;
+    if txs.len() != receipts.len() {
+        return Err(eyre!("receipt count does not match block"));
+    }
+    let mut cumulative_gas = 0;
+    let mut log_index = 0;
+    for (index, (receipt, tx)) in receipts.iter().zip(txs).enumerate() {
+        if receipt.transaction_hash() != tx.tx_hash()
+            || receipt.transaction_index() != Some(index as u64)
+            || receipt.block_hash() != Some(block.header().hash())
+            || receipt.block_number() != Some(block.header().number())
+            || receipt.from() != tx.from()
+            || receipt.to() != tx.to()
+            || receipt.cumulative_gas_used().checked_sub(cumulative_gas) != Some(receipt.gas_used())
+            || !N::receipt_metadata_valid(receipt, tx, block, forks)
+        {
+            return Err(eyre!("invalid receipt metadata at transaction {index}"));
+        }
+        cumulative_gas = receipt.cumulative_gas_used();
+        for log in N::receipt_logs(receipt) {
+            if log.block_hash != Some(block.header().hash())
+                || log.block_number != Some(block.header().number())
+                || log.transaction_hash != Some(tx.tx_hash())
+                || log.transaction_index != Some(index as u64)
+                || log.log_index != Some(log_index)
+                || log.removed
+                || log
+                    .block_timestamp
+                    .is_some_and(|t| t != block.header().timestamp())
+            {
+                return Err(eyre!("invalid log metadata at log {log_index}"));
+            }
+            log_index += 1;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -315,6 +380,29 @@ mod tests {
 
             assert!(result.is_ok());
         }
+    }
+
+    #[test]
+    fn test_verify_receipt_proof_without_transaction_index() {
+        // A receipt that is not included in a block carries no index. Verification
+        // must reject it rather than panic, since the receipt comes from a server
+        // whose responses are exactly what this proof is meant to check.
+        let mut receipt = rpc_tx_receipt();
+        receipt.transaction_index = None;
+
+        let result = verify_receipt_proof::<EthereumSpec>(&receipt, B256::ZERO, &[]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_transaction_proof_without_transaction_index() {
+        let mut tx = rpc_tx();
+        tx.transaction_index = None;
+
+        let result = verify_transaction_proof::<EthereumSpec>(&tx, B256::ZERO, &[]);
+
+        assert!(result.is_err());
     }
 
     #[test]

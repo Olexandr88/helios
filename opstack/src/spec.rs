@@ -1,3 +1,7 @@
+use alloy::{
+    consensus::{transaction::SignerRecoverable, Transaction as _},
+    primitives::keccak256,
+};
 use std::{collections::HashMap, sync::Arc};
 
 use alloy::{
@@ -91,15 +95,16 @@ impl NetworkSpec for OpStack {
             return false;
         }
 
-        if let Some(txs) = block.transactions.as_transactions() {
-            let txs_root = calculate_transaction_root(
-                &txs.iter()
-                    .map(|t| t.clone().inner.inner)
-                    .collect::<Vec<_>>(),
-            );
-            if txs_root != block.header.transactions_root {
-                return false;
-            }
+        let Some(txs) = block.transactions.as_transactions() else {
+            return false;
+        };
+        if calculate_transaction_root(
+            &txs.iter()
+                .map(|t| t.clone().inner.inner)
+                .collect::<Vec<_>>(),
+        ) != block.header.transactions_root
+        {
+            return false;
         }
 
         if let Some(withdrawals) = &block.withdrawals {
@@ -109,7 +114,44 @@ impl NetworkSpec for OpStack {
             // TODO: handle L2ToL1MessagePasser storage root check
         }
 
-        true
+        block.uncles.is_empty()
+    }
+
+    fn validate_block(block: &mut Self::BlockResponse, full_tx: bool) -> bool {
+        if !Self::is_hash_valid(block) {
+            return false;
+        }
+        let alloy::rpc::types::BlockTransactions::Full(txs) = &mut block.transactions else {
+            return false;
+        };
+        if full_tx {
+            for (index, tx) in txs.iter_mut().enumerate() {
+                if keccak256(tx.inner.inner.encoded_2718()) != *tx.inner.inner.tx_hash()
+                    || tx.inner.inner.inner().recover_signer().ok() != Some(tx.inner.inner.signer())
+                    || tx.inner.block_hash != Some(block.header.hash)
+                    || tx.inner.block_number != Some(block.header.number)
+                    || tx.inner.transaction_index != Some(index as u64)
+                {
+                    return false;
+                }
+                tx.inner.effective_gas_price =
+                    Some(tx.effective_gas_price(block.header.base_fee_per_gas));
+                // These belong to the receipt and are not part of the transaction trie.
+                tx.deposit_nonce = None;
+                tx.deposit_receipt_version = None;
+            }
+        } else {
+            // Cached RPC hashes are not committed by the transaction trie. Derive
+            // the only transaction field exposed by this response from signed bytes.
+            block.transactions = alloy::rpc::types::BlockTransactions::Hashes(
+                txs.iter()
+                    .map(|tx| keccak256(Self::encode_transaction(tx)))
+                    .collect(),
+            );
+        }
+        block.header.total_difficulty = None;
+        block.header.size = None;
+        block.uncles.is_empty()
     }
 
     fn receipt_contains(list: &[Self::ReceiptResponse], elem: &Self::ReceiptResponse) -> bool {
@@ -122,8 +164,35 @@ impl NetworkSpec for OpStack {
         false
     }
 
+    fn sanitize_receipt(receipt: &mut Self::ReceiptResponse) {
+        // L1/operator fee fields are not encoded in the OP receipt trie.
+        receipt.l1_block_info = Default::default();
+    }
+
     fn receipt_logs(receipt: &Self::ReceiptResponse) -> Vec<Log> {
         receipt.inner.inner.logs().to_vec()
+    }
+
+    fn receipt_metadata_valid(
+        receipt: &Self::ReceiptResponse,
+        tx: &Self::TransactionResponse,
+        block: &Self::BlockResponse,
+        _forks: &ForkSchedule,
+    ) -> bool {
+        use alloy::consensus::Transaction;
+        let nonce = receipt
+            .inner
+            .inner
+            .deposit_nonce()
+            .unwrap_or_else(|| tx.nonce());
+        let contract_address = tx
+            .is_create()
+            .then(|| tx.inner.inner.signer().create(nonce));
+        receipt.inner.contract_address == contract_address
+            && receipt.inner.effective_gas_price
+                == tx.effective_gas_price(block.header.base_fee_per_gas)
+            && receipt.inner.blob_gas_used.is_none()
+            && receipt.inner.blob_gas_price.is_none()
     }
 
     async fn transact<E: ExecutionProvider<Self>>(

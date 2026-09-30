@@ -9,6 +9,7 @@ use alloy::hex::{self, FromHex};
 use alloy::primitives::{Address, B256, U256};
 use alloy::rpc::types::{state::StateOverride, Filter, TransactionRequest};
 use eyre::Result;
+use futures_util::future::{AbortHandle, Abortable};
 use url::Url;
 use wasm_bindgen::prelude::*;
 use web_sys::js_sys::Function;
@@ -67,6 +68,7 @@ pub struct EthereumClient {
     chain_id: u64,
     active_subscriptions: HashMap<String, Subscription<Ethereum>>,
     event_handler: Option<Function>,
+    events_abort_handle: Option<AbortHandle>,
 }
 
 #[wasm_bindgen]
@@ -125,6 +127,7 @@ impl EthereumClient {
 
             chain: base.chain,
             forks: base.forks,
+            execution_forks: base.execution_forks,
 
             database_type: Some(db_type),
             ..Default::default()
@@ -141,6 +144,7 @@ impl EthereumClient {
             chain_id,
             active_subscriptions: HashMap::new(),
             event_handler: None,
+            events_abort_handle: None,
         })
     }
 
@@ -154,9 +158,7 @@ impl EthereumClient {
         let sub_type: SubscriptionType = serde_wasm_bindgen::from_value(sub_type)?;
         let rx = map_err(self.inner.subscribe(sub_type).await)?;
 
-        let subscription = Subscription::<Ethereum>::new(id.clone());
-
-        subscription.listen(rx, callback).await;
+        let subscription = Subscription::<Ethereum>::spawn_listener(id.clone(), rx, callback);
         self.active_subscriptions.insert(id, subscription);
 
         Ok(true)
@@ -173,13 +175,14 @@ impl EthereumClient {
     }
 
     #[wasm_bindgen]
-    pub fn chain_id(&self) -> u32 {
-        self.chain_id as u32
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     #[wasm_bindgen]
-    pub async fn get_block_number(&self) -> Result<u32, JsError> {
-        map_err(self.inner.get_block_number().await).map(|v| v.to())
+    pub async fn get_block_number(&self) -> Result<String, JsError> {
+        let v = map_err(self.inner.get_block_number().await)?;
+        Ok(format!("0x{:x}", v))
     }
 
     #[wasm_bindgen]
@@ -343,12 +346,13 @@ impl EthereumClient {
         opts: JsValue,
         block: JsValue,
         state_overrides: JsValue,
-    ) -> Result<u32, JsError> {
+    ) -> Result<String, JsError> {
         let opts: TransactionRequest = serde_wasm_bindgen::from_value(opts)?;
-        let block: BlockId = serde_wasm_bindgen::from_value(block)?;
+        let block: Option<BlockId> = serde_wasm_bindgen::from_value(block)?;
         let state_overrides: Option<StateOverride> =
             serde_wasm_bindgen::from_value(state_overrides)?;
-        Ok(map_err(self.inner.estimate_gas(&opts, block, state_overrides).await)? as u32)
+        let gas = map_err(self.inner.estimate_gas(&opts, block, state_overrides).await)?;
+        Ok(format!("0x{gas:x}"))
     }
 
     #[wasm_bindgen]
@@ -451,7 +455,10 @@ impl EthereumClient {
 
         let mut rx = map_err(self.inner.new_checkpoints_recv())?;
 
-        wasm_bindgen_futures::spawn_local(async move {
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        self.events_abort_handle = Some(abort_handle);
+
+        let future = async move {
             loop {
                 if rx.changed().await.is_err() {
                     break;
@@ -468,6 +475,10 @@ impl EthereumClient {
                     }
                 }
             }
+        };
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = Abortable::new(future, abort_registration).await;
         });
 
         Ok(())
@@ -479,5 +490,20 @@ impl EthereumClient {
         Ok(serde_wasm_bindgen::to_value(
             &checkpoint.map(|c| format!("0x{}", hex::encode(c))),
         )?)
+    }
+
+    #[wasm_bindgen]
+    pub async fn shutdown(&mut self) {
+        if let Some(abort_handle) = self.events_abort_handle.take() {
+            abort_handle.abort();
+        }
+
+        self.event_handler = None;
+
+        for (_, subscription) in self.active_subscriptions.drain() {
+            subscription.abort();
+        }
+
+        self.inner.shutdown().await;
     }
 }

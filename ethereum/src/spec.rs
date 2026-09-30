@@ -1,3 +1,7 @@
+use alloy::{
+    consensus::{transaction::SignerRecoverable, Transaction as _},
+    primitives::keccak256,
+};
 use std::{collections::HashMap, sync::Arc};
 
 use alloy::{
@@ -63,24 +67,59 @@ impl NetworkSpec for Ethereum {
             return false;
         }
 
-        if let Some(txs) = block.transactions.as_transactions() {
-            let txs_root = calculate_transaction_root(
-                &txs.iter().map(|t| t.clone().inner).collect::<Vec<_>>(),
+        let Some(txs) = block.transactions.as_transactions() else {
+            return false;
+        };
+        if calculate_transaction_root(&txs.iter().map(|t| t.clone().inner).collect::<Vec<_>>())
+            != block.header.transactions_root
+        {
+            return false;
+        }
+
+        let withdrawals_root = block
+            .withdrawals
+            .as_ref()
+            .map(|withdrawals| calculate_withdrawals_root(withdrawals));
+        if withdrawals_root != block.header.withdrawals_root {
+            return false;
+        }
+
+        block.uncles.is_empty()
+    }
+
+    fn validate_block(block: &mut Self::BlockResponse, full_tx: bool) -> bool {
+        if !Self::is_hash_valid(block) {
+            return false;
+        }
+        let alloy::rpc::types::BlockTransactions::Full(txs) = &mut block.transactions else {
+            return false;
+        };
+        if full_tx {
+            for (index, tx) in txs.iter_mut().enumerate() {
+                // Neither the cached hash nor recovered sender is authenticated by the trie root.
+                if keccak256(tx.inner.encoded_2718()) != *tx.inner.tx_hash()
+                    || tx.inner.inner().recover_signer().ok() != Some(tx.inner.signer())
+                    || tx.block_hash != Some(block.header.hash)
+                    || tx.block_number != Some(block.header.number)
+                    || tx.transaction_index != Some(index as u64)
+                {
+                    return false;
+                }
+                tx.effective_gas_price =
+                    Some(tx.inner.effective_gas_price(block.header.base_fee_per_gas));
+            }
+        } else {
+            // Cached RPC hashes are not committed by the transaction trie. Derive
+            // the only transaction field exposed by this response from signed bytes.
+            block.transactions = alloy::rpc::types::BlockTransactions::Hashes(
+                txs.iter()
+                    .map(|tx| keccak256(Self::encode_transaction(tx)))
+                    .collect(),
             );
-            if txs_root != block.header.transactions_root {
-                return false;
-            }
         }
-
-        if let Some(withdrawals) = &block.withdrawals {
-            let withdrawals_root =
-                calculate_withdrawals_root(&withdrawals.iter().copied().collect::<Vec<_>>());
-            if Some(withdrawals_root) != block.header.withdrawals_root {
-                return false;
-            }
-        }
-
-        true
+        block.header.total_difficulty = None;
+        block.header.size = None;
+        block.uncles.is_empty()
     }
 
     fn receipt_contains(list: &[Self::ReceiptResponse], elem: &Self::ReceiptResponse) -> bool {
@@ -95,6 +134,29 @@ impl NetworkSpec for Ethereum {
 
     fn receipt_logs(receipt: &Self::ReceiptResponse) -> Vec<Log> {
         receipt.inner.logs().to_vec()
+    }
+
+    fn receipt_metadata_valid(
+        receipt: &Self::ReceiptResponse,
+        tx: &Self::TransactionResponse,
+        block: &Self::BlockResponse,
+        forks: &ForkSchedule,
+    ) -> bool {
+        let contract_address = tx.is_create().then(|| tx.inner.signer().create(tx.nonce()));
+        let blob_gas_used = tx.blob_gas_used();
+        let blob_gas_price = blob_gas_used.and_then(|_| {
+            block.header.excess_blob_gas.map(|excess| {
+                alloy::eips::eip4844::fake_exponential(
+                    1,
+                    excess as u128,
+                    forks.get_blob_base_fee_update_fraction(block.header.timestamp) as u128,
+                )
+            })
+        });
+        receipt.contract_address == contract_address
+            && receipt.effective_gas_price == tx.effective_gas_price(block.header.base_fee_per_gas)
+            && receipt.blob_gas_used == blob_gas_used
+            && receipt.blob_gas_price == blob_gas_price
     }
 
     async fn transact<E: ExecutionProvider<Self>>(

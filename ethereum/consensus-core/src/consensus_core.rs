@@ -16,14 +16,14 @@ use crate::proof::{
     is_current_committee_proof_valid, is_execution_payload_proof_valid, is_finality_proof_valid,
     is_next_committee_proof_valid,
 };
-use crate::types::bls::{PublicKey, Signature};
+use crate::types::bls::Signature;
 use crate::types::{
-    BeaconBlockHeader, Bootstrap, ExecutionPayloadHeader, FinalityUpdate, Forks, GenericUpdate,
-    LightClientHeader, LightClientStore, OptimisticUpdate, Update,
+    BeaconBlockHeader, Bootstrap, FinalityUpdate, Forks, GenericUpdate, LightClientHeader,
+    LightClientStore, OptimisticUpdate, Update,
 };
 use crate::utils::{
     calculate_fork_version, compute_committee_sign_root, compute_fork_data_root,
-    get_participating_keys,
+    get_participating_aggregate_pubkey,
 };
 
 pub fn verify_bootstrap<S: ConsensusSpec>(
@@ -47,7 +47,7 @@ pub fn verify_bootstrap<S: ConsensusSpec>(
     let header_valid = header_hash == checkpoint;
 
     if !header_valid {
-        return Err(ConsensusError::InvalidHeaderHash(checkpoint, header_hash).into());
+        return Err(ConsensusError::InvalidHeaderHash(header_hash, checkpoint).into());
     }
 
     if !committee_valid {
@@ -343,12 +343,15 @@ pub fn verify_generic_update<S: ConsensusSpec>(
         store.next_sync_committee.as_ref().unwrap()
     };
 
-    let pks = get_participating_keys(sync_committee, &update.sync_aggregate.sync_committee_bits)?;
+    let agg_pk = get_participating_aggregate_pubkey(
+        sync_committee,
+        &update.sync_aggregate.sync_committee_bits,
+    )?;
 
     let fork_version = calculate_fork_version::<S>(forks, update.signature_slot.saturating_sub(1));
     let fork_data_root = compute_fork_data_root(fork_version, genesis_root);
     let is_valid_sig = verify_sync_committee_signature(
-        &pks,
+        &agg_pk,
         update.attested_header.beacon(),
         &update.sync_aggregate.sync_committee_signature,
         fork_data_root,
@@ -369,9 +372,8 @@ pub fn force_update<S: ConsensusSpec>(store: &mut LightClientStore<S>, current_s
             if best_valid_update
                 .finalized_header
                 .as_ref()
-                .unwrap()
-                .beacon()
-                .slot
+                .map(|header| header.beacon().slot)
+                .unwrap_or_default()
                 <= store.finalized_header.beacon().slot
             {
                 best_valid_update.finalized_header =
@@ -484,14 +486,14 @@ fn has_finality_update<S: ConsensusSpec>(update: &GenericUpdate<S>) -> bool {
 }
 
 fn verify_sync_committee_signature(
-    pks: &[PublicKey],
+    aggregate_public_key: &bls12_381::G1Affine,
     attested_header: &BeaconBlockHeader,
     signature: &Signature,
     fork_data_root: B256,
 ) -> bool {
     let header_root = attested_header.tree_hash_root();
     let signing_root = compute_committee_sign_root(header_root, fork_data_root);
-    signature.verify(signing_root.as_slice(), pks)
+    signature.verify(signing_root.as_slice(), aggregate_public_key)
 }
 
 fn safety_threshold<S: ConsensusSpec>(store: &LightClientStore<S>) -> u64 {
@@ -509,26 +511,39 @@ fn is_valid_header<S: ConsensusSpec>(header: &LightClientHeader, forks: &Forks) 
     // includes blocks that have the blob fields set pre-deneb.
     if epoch < forks.capella.epoch {
         header.execution().is_err() && header.execution_branch().is_err()
-    } else if header.execution().is_ok() && header.execution_branch().is_ok() {
-        let execution = header.execution().unwrap();
-        let execution_branch = header.execution_branch().unwrap();
-
-        let valid_execution_type = match execution {
-            ExecutionPayloadHeader::Electra(_) => epoch >= forks.electra.epoch,
-            ExecutionPayloadHeader::Deneb(_) => epoch >= forks.deneb.epoch,
-            ExecutionPayloadHeader::Capella(_) => {
-                epoch >= forks.capella.epoch && epoch < forks.deneb.epoch
-            }
-            ExecutionPayloadHeader::Bellatrix(_) => {
-                epoch >= forks.bellatrix.epoch && epoch < forks.altair.epoch
-            }
-        };
-
-        let proof_valid =
-            is_execution_payload_proof_valid(header.beacon(), execution, execution_branch);
-
-        proof_valid && valid_execution_type
+    } else if let (Ok(execution), Ok(execution_branch)) =
+        (header.execution(), header.execution_branch())
+    {
+        is_execution_payload_proof_valid(header.beacon(), execution, execution_branch)
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{consensus_spec::MinimalConsensusSpec, types::LightClientHeaderBellatrix};
+    #[test]
+    fn force_update_without_finality_uses_attested_header() {
+        let mut store = LightClientStore::<MinimalConsensusSpec> {
+            best_valid_update: Some(GenericUpdate {
+                attested_header: LightClientHeader::Bellatrix(LightClientHeaderBellatrix {
+                    beacon: BeaconBlockHeader {
+                        slot: 1,
+                        ..Default::default()
+                    },
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        force_update(
+            &mut store,
+            MinimalConsensusSpec::slots_per_sync_committee_period() + 1,
+        );
+        assert_eq!(store.finalized_header.beacon().slot, 1);
+        assert_eq!(store.optimistic_header.beacon().slot, 1);
+        assert!(store.best_valid_update.is_none());
     }
 }

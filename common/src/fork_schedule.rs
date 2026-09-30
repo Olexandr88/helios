@@ -22,16 +22,20 @@ pub struct ForkSchedule {
     pub cancun_timestamp: u64,
     pub prague_timestamp: u64,
     pub osaka_timestamp: u64,
+    pub bpo1_timestamp: u64,
+    pub bpo2_timestamp: u64,
 
     // Optimism Forks
     pub bedrock_timestamp: u64,
     pub regolith_timestamp: u64,
     pub canyon_timestamp: u64,
+    pub delta_timestamp: u64,
     pub ecotone_timestamp: u64,
     pub fjord_timestamp: u64,
     pub granite_timestamp: u64,
     pub holocene_timestamp: u64,
     pub isthmus_timestamp: u64,
+    pub jovian_timestamp: u64,
 }
 
 impl Default for ForkSchedule {
@@ -57,27 +61,63 @@ impl Default for ForkSchedule {
             cancun_timestamp: u64::MAX,
             prague_timestamp: u64::MAX,
             osaka_timestamp: u64::MAX,
+            bpo1_timestamp: u64::MAX,
+            bpo2_timestamp: u64::MAX,
 
             bedrock_timestamp: u64::MAX,
             regolith_timestamp: u64::MAX,
             canyon_timestamp: u64::MAX,
+            delta_timestamp: u64::MAX,
             ecotone_timestamp: u64::MAX,
             fjord_timestamp: u64::MAX,
             granite_timestamp: u64::MAX,
             holocene_timestamp: u64::MAX,
             isthmus_timestamp: u64::MAX,
+            jovian_timestamp: u64::MAX,
         }
     }
 }
 
 impl ForkSchedule {
     /// Get the blob base fee update fraction for a given timestamp.
-    /// The fraction changes from Cancun to Prague according to EIP-7892.
+    /// EIP-7691 changes the Prague fraction; EIP-7892 permits later BPO changes.
     pub fn get_blob_base_fee_update_fraction(&self, timestamp: u64) -> u64 {
-        if timestamp >= self.prague_timestamp {
-            5007716 // Prague and later (EIP-7892)
+        if self.bpo2_timestamp != u64::MAX && timestamp >= self.bpo2_timestamp {
+            11684671
+        } else if self.bpo1_timestamp != u64::MAX && timestamp >= self.bpo1_timestamp {
+            8346193
+        } else if self.prague_timestamp != u64::MAX && timestamp >= self.prague_timestamp {
+            5007716
         } else {
             3338477 // Cancun
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_prices_follow_each_activation_boundary() {
+        let forks = ForkSchedule {
+            prague_timestamp: 10,
+            osaka_timestamp: 20,
+            bpo1_timestamp: 30,
+            bpo2_timestamp: 40,
+            ..Default::default()
+        };
+        for (timestamp, fraction) in [
+            (9, 3338477),
+            (10, 5007716),
+            (19, 5007716),
+            (20, 5007716),
+            (29, 5007716),
+            (30, 8346193),
+            (39, 8346193),
+            (40, 11684671),
+        ] {
+            assert_eq!(forks.get_blob_base_fee_update_fraction(timestamp), fraction);
         }
     }
 }

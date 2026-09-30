@@ -59,34 +59,45 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> No
             loop {
                 select! {
                     block = block_recv.recv() => {
-                        if let Some(block) = block {
-                            let block_number = block.header().number();
-                            let timestamp = block.header().timestamp();
+                        match block {
+                            Some(block) => {
+                                let block_number = block.header().number();
+                                let timestamp = block.header().timestamp();
 
-                            // Calculate age of the block
-                            let current_time = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
+                                // Calculate age of the block
+                                let current_time = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
 
-                            let age = current_time.saturating_sub(timestamp);
+                                let age = current_time.saturating_sub(timestamp);
 
-                            info!(
-                                target: "helios::client",
-                                "latest block     number={} age={}s",
-                                block_number,
-                                age
-                            );
+                                info!(
+                                    target: "helios::client",
+                                    "latest block     number={} age={}s",
+                                    block_number,
+                                    age
+                                );
 
-                            execution_ref.push_block(
-                                block.clone(),
-                                BlockId::Number(BlockNumberOrTag::Latest)
-                            ).await;
+                                execution_ref.push_block(
+                                    block.clone(),
+                                    BlockId::Number(BlockNumberOrTag::Latest)
+                                ).await;
 
-                            _ = block_broadcast_ref.send(SubscriptionEvent::NewHeads(block));
+                                _ = block_broadcast_ref.send(SubscriptionEvent::NewHeads(block));
+                            }
+                            None => {
+                                // Sender dropped, consensus task has exited - client is no longer usable
+                                warn!(target: "helios::client", "consensus client stopped, shut Helios down manually");
+                                break;
+                            }
                         }
                     },
-                    _ = finalized_block_recv.changed() => {
+                    finalized_changed = finalized_block_recv.changed() => {
+                        if finalized_changed.is_err() {
+                            warn!(target: "helios::client", "consensus client stopped, shut Helios down manually");
+                            break;
+                        }
                         let block = finalized_block_recv.borrow_and_update().clone();
                         if let Some(block) = block {
                             let block_number = block.header().number();
@@ -147,7 +158,7 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> No
             .header()
             .timestamp();
 
-        let delay = timestamp.checked_sub(block_timestamp).unwrap_or_default();
+        let delay = timestamp.saturating_sub(block_timestamp);
         if delay > 60 {
             return Err(ClientError::OutOfSync(delay));
         }
@@ -204,9 +215,10 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>, E: ExecutionProvider<N>> He
     async fn estimate_gas(
         &self,
         tx: &N::TransactionRequest,
-        block_id: BlockId,
+        block_id: Option<BlockId>,
         state_overrides: Option<StateOverride>,
     ) -> Result<u64> {
+        let block_id = block_id.unwrap_or(BlockId::latest());
         self.check_blocktag_age(&block_id).await?;
 
         let (result, ..) = N::transact(

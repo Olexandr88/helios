@@ -2,14 +2,14 @@ use std::{collections::HashMap, marker::PhantomData, mem, sync::Arc};
 
 use alloy::{
     consensus::{BlockHeader, TxType},
-    eips::BlockId,
+    eips::{eip1898::RpcBlockHash, BlockId},
     network::TransactionBuilder,
     rpc::types::{state::StateOverride, Block, Header, Transaction, TransactionRequest},
 };
 use eyre::Result;
 use revm::{
     context::{result::ExecutionResult, BlockEnv, CfgEnv, ContextTr, TxEnv},
-    context_interface::block::BlobExcessGasAndPrice,
+    context_interface::{block::BlobExcessGasAndPrice, either::Either},
     primitives::{eip7825, hardfork::SpecId, Address, U256},
     Context, ExecuteEvm, MainBuilder, MainContext,
 };
@@ -55,7 +55,18 @@ impl<E: ExecutionProvider<Ethereum>> EthereumEvm<E> {
         validate_tx: bool,
         state_overrides: Option<StateOverride>,
     ) -> Result<(ExecutionResult, HashMap<Address, Account>), EvmError> {
-        let mut db = ProofDB::new(self.block_id, self.execution.clone(), state_overrides);
+        let block = self
+            .execution
+            .get_block(self.block_id, false)
+            .await
+            .map_err(|err| EvmError::Generic(err.to_string()))?
+            .ok_or(ExecutionError::BlockNotFound(self.block_id))
+            .map_err(|err| EvmError::Generic(err.to_string()))?;
+
+        // Pin block to a specific hash for the entire EVM run.
+        let pinned_block: RpcBlockHash = block.header.hash.into();
+
+        let mut db = ProofDB::new(pinned_block, self.execution.clone(), state_overrides);
         _ = db.state.prefetch_state(tx, validate_tx).await;
 
         // Track iterations for debugging
@@ -78,7 +89,7 @@ impl<E: ExecutionProvider<Ethereum>> EthereumEvm<E> {
             }
 
             // Create EVM after any async operations
-            let context = self.get_context(tx, self.block_id, validate_tx).await?;
+            let context = self.get_context(tx, &block, validate_tx);
 
             // Execute in a scope to ensure EVM is dropped before any potential async operations
             let (result, needs_update) = {
@@ -96,27 +107,16 @@ impl<E: ExecutionProvider<Ethereum>> EthereumEvm<E> {
         tx_res.map_err(|err| EvmError::Generic(format!("generic: {err}")))
     }
 
-    async fn get_context(
+    fn get_context(
         &self,
         tx: &TransactionRequest,
-        block_id: BlockId,
+        block: &Block<Transaction>,
         validate_tx: bool,
-    ) -> Result<Context, EvmError> {
-        let block = self
-            .execution
-            .get_block(block_id, false)
-            .await
-            .map_err(|err| EvmError::Generic(err.to_string()))?
-            .ok_or(ExecutionError::BlockNotFound(block_id))
-            .map_err(|err| EvmError::Generic(err.to_string()))?;
-
-        let spec = get_spec_id_for_block_timestamp(block.header.timestamp(), &self.fork_schedule);
+    ) -> Context {
+        let spec = get_spec_id_for_block_timestamp(block.header.timestamp, &self.fork_schedule);
         let mut tx_env = Self::tx_env(tx, spec);
 
-        if <TxType as Into<u8>>::into(
-            <TransactionRequest as TransactionBuilder<Ethereum>>::output_tx_type(tx),
-        ) == 0u8
-        {
+        if tx_env.tx_type == TxType::Legacy as u8 {
             tx_env.chain_id = None;
         } else {
             tx_env.chain_id = Some(self.chain_id);
@@ -130,10 +130,10 @@ impl<E: ExecutionProvider<Ethereum>> EthereumEvm<E> {
         cfg.disable_base_fee = !validate_tx;
         cfg.disable_nonce_check = !validate_tx;
 
-        Ok(Context::mainnet()
+        Context::mainnet()
             .with_tx(tx_env)
-            .with_block(Self::block_env(&block, &self.fork_schedule))
-            .with_cfg(cfg))
+            .with_block(Self::block_env(block, &self.fork_schedule))
+            .with_cfg(cfg)
     }
 
     fn tx_env(tx: &TransactionRequest, spec: SpecId) -> TxEnv {
@@ -143,12 +143,11 @@ impl<E: ExecutionProvider<Ethereum>> EthereumEvm<E> {
             u64::MAX
         };
         TxEnv {
-            tx_type: tx.transaction_type.unwrap_or_default(),
+            tx_type: tx.transaction_type.unwrap_or(tx.minimal_tx_type() as u8),
             caller: tx.from.unwrap_or_default(),
             gas_limit: <TransactionRequest as TransactionBuilder<Ethereum>>::gas_limit(tx)
                 .unwrap_or(default_gas_limit),
-            gas_price: <TransactionRequest as TransactionBuilder<Ethereum>>::gas_price(tx)
-                .unwrap_or_default(),
+            gas_price: tx.gas_price.or(tx.max_fee_per_gas).unwrap_or_default(),
             kind: tx.to.unwrap_or_default(),
             value: tx.value.unwrap_or_default(),
             data: <TransactionRequest as TransactionBuilder<Ethereum>>::input(tx)
@@ -168,7 +167,13 @@ impl<E: ExecutionProvider<Ethereum>> EthereumEvm<E> {
                 .as_ref()
                 .map(|v| v.to_vec())
                 .unwrap_or_default(),
-            authorization_list: vec![],
+            authorization_list: tx
+                .authorization_list
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(Either::Left)
+                .collect(),
         }
     }
 
@@ -237,5 +242,114 @@ pub fn get_spec_id_for_block_timestamp(timestamp: u64, fork_schedule: &ForkSched
         SpecId::FRONTIER
     } else {
         SpecId::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+    use helios_core::execution::providers::{
+        block::block_cache::BlockCache, rpc::RpcExecutionProvider,
+    };
+    use revm::{
+        database::InMemoryDB,
+        state::{AccountInfo, Bytecode},
+    };
+    fn test_evm() -> EthereumEvm<RpcExecutionProvider<Ethereum, BlockCache<Ethereum>, ()>> {
+        let config = crate::config::networks::mainnet();
+        let provider = RpcExecutionProvider::<Ethereum, _, ()>::new(
+            "http://localhost:1".parse().unwrap(),
+            BlockCache::new(),
+            config.execution_forks,
+        );
+        EthereumEvm::new(
+            Arc::new(provider),
+            config.chain.chain_id,
+            config.execution_forks,
+            BlockId::latest(),
+        )
+    }
+
+    #[tokio::test]
+    async fn eip1559_call_uses_effective_gas_price() {
+        let evm = test_evm();
+        let caller = address!("1111111111111111111111111111111111111111");
+        let recipient = address!("2222222222222222222222222222222222222222");
+        let mut block: Block<Transaction> = Block::default();
+        block.header.gas_limit = 100_000_000;
+        block.header.timestamp = evm.fork_schedule.prague_timestamp;
+        block.header.base_fee_per_gas = Some(5);
+        let tx = TransactionRequest::default()
+            .from(caller)
+            .to(recipient)
+            .max_fee_per_gas(20)
+            .max_priority_fee_per_gas(2)
+            .gas_limit(1_000_000);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo::from_balance(U256::from(10_000_000_000u64)),
+        );
+        db.insert_account_info(
+            recipient,
+            AccountInfo::default().with_code(Bytecode::new_raw(alloy::primitives::bytes!(
+                "3a60005260206000f3"
+            ))),
+        );
+        let result = evm
+            .get_context(&tx, &block, false)
+            .with_db(db)
+            .build_mainnet()
+            .replay()
+            .unwrap()
+            .result;
+        assert_eq!(
+            result.output().unwrap().as_ref(),
+            U256::from(7).to_be_bytes::<32>()
+        );
+    }
+
+    #[tokio::test]
+    async fn eip7702_call_executes_authorized_code() {
+        use alloy::{eips::eip7702::Authorization, primitives::Signature};
+        let evm = test_evm();
+        let caller = address!("1111111111111111111111111111111111111111");
+        let delegate = address!("2222222222222222222222222222222222222222");
+        // Any recoverable signature defines an authority; no private key is needed for this test.
+        let auth = Authorization {
+            chain_id: U256::ZERO,
+            address: delegate,
+            nonce: 0,
+        }
+        .into_signed(Signature::new(U256::from(1), U256::from(2), false));
+        let authority = auth.recover_authority().unwrap();
+        let mut block: Block<Transaction> = Block::default();
+        block.header.gas_limit = 100_000_000;
+        block.header.timestamp = evm.fork_schedule.prague_timestamp;
+        let tx = TransactionRequest {
+            authorization_list: Some(vec![auth]),
+            transaction_type: Some(4),
+            gas: Some(1_000_000),
+            ..TransactionRequest::default().from(caller).to(authority)
+        };
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            delegate,
+            AccountInfo::default().with_code(Bytecode::new_raw(alloy::primitives::bytes!(
+                "602a60005260206000f3"
+            ))),
+        );
+        let result = evm
+            .get_context(&tx, &block, false)
+            .with_db(db)
+            .build_mainnet()
+            .replay()
+            .unwrap()
+            .result;
+        assert_eq!(
+            result.output().unwrap().as_ref(),
+            U256::from(42).to_be_bytes::<32>()
+        );
     }
 }

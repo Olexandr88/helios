@@ -1,13 +1,13 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use alloy::{
-    eips::{BlockId, BlockNumberOrTag},
+    eips::{eip1898::RpcBlockHash, BlockNumberOrTag},
     network::{primitives::HeaderResponse, BlockResponse},
     rpc::types::state::{AccountOverride, StateOverride},
 };
 use eyre::Result;
 use revm::{
-    primitives::{address, Address, B256, KECCAK_EMPTY, U256},
+    primitives::{Address, B256, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode},
     Database,
 };
@@ -28,11 +28,11 @@ pub struct ProofDB<N: NetworkSpec, E: ExecutionProvider<N>> {
 
 impl<N: NetworkSpec, E: ExecutionProvider<N>> ProofDB<N, E> {
     pub fn new(
-        block_id: BlockId,
+        block: RpcBlockHash,
         execution: Arc<E>,
         state_overrides: Option<StateOverride>,
     ) -> Self {
-        let state = EvmState::new(execution, block_id, state_overrides);
+        let state = EvmState::new(execution, block, state_overrides);
         ProofDB { state }
     }
 }
@@ -47,7 +47,7 @@ pub enum StateAccess {
 pub struct EvmState<N: NetworkSpec, E: ExecutionProvider<N>> {
     pub accounts: HashMap<Address, Account>,
     pub block_hash: HashMap<u64, B256>,
-    pub block: BlockId,
+    pub block: RpcBlockHash,
     pub access: Option<StateAccess>,
     pub execution: Arc<E>,
     pub state_overrides: Option<StateOverride>,
@@ -55,7 +55,11 @@ pub struct EvmState<N: NetworkSpec, E: ExecutionProvider<N>> {
 }
 
 impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
-    pub fn new(execution: Arc<E>, block: BlockId, state_overrides: Option<StateOverride>) -> Self {
+    pub fn new(
+        execution: Arc<E>,
+        block: RpcBlockHash,
+        state_overrides: Option<StateOverride>,
+    ) -> Self {
         Self {
             execution,
             block,
@@ -73,7 +77,7 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
                 StateAccess::Basic(address) => {
                     let account = self
                         .execution
-                        .get_account(address, &[], true, self.block)
+                        .get_account(address, &[], true, self.block.into())
                         .await?;
 
                     self.accounts.insert(address, account);
@@ -82,7 +86,7 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
                     let slot_bytes = B256::from(slot);
                     let account = self
                         .execution
-                        .get_account(address, &[slot_bytes], true, self.block)
+                        .get_account(address, &[slot_bytes], false, self.block.into())
                         .await?;
 
                     if let Some(stored_account) = self.accounts.get_mut(&address) {
@@ -124,6 +128,12 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
             .and_then(|overrides| overrides.get(&address));
 
         if let Some(account) = self.accounts.get_mut(&address) {
+            let code_is_overriden = override_opt.and_then(|o| o.code.as_ref()).is_some();
+            if account.code.is_none() && !code_is_overriden {
+                self.access = Some(StateAccess::Basic(address));
+                return Err(DatabaseError::StateMissing);
+            }
+
             if let Some(override_opt) = override_opt {
                 apply_account_overrides(account, override_opt)?;
             }
@@ -194,7 +204,7 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> EvmState<N, E> {
     ) -> Result<()> {
         let account_map = self
             .execution
-            .get_execution_hint(tx, validate_tx, self.block)
+            .get_execution_hint(tx, validate_tx, self.block.into())
             .await
             .map_err(EvmError::RpcError)?;
 
@@ -210,10 +220,6 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> Database for ProofDB<N, E> {
     type Error = DatabaseError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, DatabaseError> {
-        if is_precompile(&address) {
-            return Ok(Some(AccountInfo::default()));
-        }
-
         trace!(
             target: "helios::evm",
             "fetch basic evm state for address=0x{}",
@@ -236,10 +242,6 @@ impl<N: NetworkSpec, E: ExecutionProvider<N>> Database for ProofDB<N, E> {
     fn code_by_hash(&mut self, _code_hash: B256) -> Result<Bytecode, DatabaseError> {
         Err(DatabaseError::Unimplemented)
     }
-}
-
-fn is_precompile(address: &Address) -> bool {
-    address.le(&address!("0000000000000000000000000000000000000009")) && address.gt(&Address::ZERO)
 }
 
 fn apply_account_overrides(
