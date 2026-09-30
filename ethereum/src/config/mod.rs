@@ -28,7 +28,8 @@ mod types;
 #[derive(Deserialize, Debug)]
 pub struct Config {
     pub consensus_rpc: Url,
-    pub execution_rpc: Option<Url>,
+    #[serde(default, deserialize_with = "deserialize_urls")]
+    pub execution_rpc: Option<Vec<Url>>,
     pub verifiable_api: Option<Url>,
     pub rpc_bind_ip: Option<IpAddr>,
     pub rpc_port: Option<u16>,
@@ -143,4 +144,24 @@ impl Default for Config {
             database_type: None,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+/// Accepts either a single URL string or a list of URLs, so existing configs keep working.
+fn deserialize_urls<'de, D>(deserializer: D) -> Result<Option<Vec<Url>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        Option::<OneOrMany<Url>>::deserialize(deserializer)?.map(|v| match v {
+            OneOrMany::One(u) => vec![u],
+            OneOrMany::Many(v) => v,
+        }),
+    )
 }
